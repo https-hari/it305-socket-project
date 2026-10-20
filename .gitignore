@@ -1,0 +1,8 @@
+# Linux binaries built inside Docker / on the lab machines
+Part*/server
+Part*/client
+*.o
+out/
+Results/benchmark_runs/
+__pycache__/
+.DS_Store

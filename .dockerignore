@@ -1,0 +1,5 @@
+server
+client
+*.o
+Results/benchmark_runs
+out
