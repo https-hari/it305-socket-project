@@ -74,13 +74,15 @@ static void sleep_ms(long ms) {
 /* Delay before reconnecting after an interrupted transfer. Default 0 ms so that measurements reflect the
    protocol, not an artificial back-off; override with IT305_RECONNECT_DELAY_MS for a polite back-off. */
 static long reconnect_delay_ms(void) {
-    static long cached = -1;
-    if (cached < 0) {
+    static long cached = -1;           /* read/written with atomics: called from several worker threads */
+    long v = __atomic_load_n(&cached, __ATOMIC_RELAXED);
+    if (v < 0) {
         const char *e = getenv("IT305_RECONNECT_DELAY_MS");
-        long v = e ? atol(e) : 0;
-        cached = v < 0 ? 0 : v;
+        v = e ? atol(e) : 0;
+        if (v < 0) v = 0;
+        __atomic_store_n(&cached, v, __ATOMIC_RELAXED);
     }
-    return cached;
+    return v;
 }
 
 static uint64_t monotonic_ns(void) {
@@ -106,7 +108,7 @@ static int connect_to_server(const char *host, int port, int enhanced) {
     hints.ai_socktype = SOCK_STREAM;
     struct addrinfo *list = NULL;
     int e = getaddrinfo(host, service, &hints, &list);
-    if (e != 0) { fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(e)); return -1; }
+    if (e != 0) { fprintf(stderr, "getaddrinfo(%s): %s\n", host, gai_strerror(e)); return -2; }
     int sock = -1;
     for (struct addrinfo *it = list; it; it = it->ai_next) {
         sock = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
@@ -117,6 +119,35 @@ static int connect_to_server(const char *host, int port, int enhanced) {
     }
     freeaddrinfo(list);
     return sock;
+}
+
+/* Connect, retrying for up to IT305_CONNECT_TIMEOUT_S seconds (default 10). A server that is down, on another port or
+ * behind a firewall now produces a clear error and a non-zero exit instead of minutes of silent retries; a server that
+ * restarts within the budget is picked up again (and the transfer resumes where the design allows it). */
+static int connect_with_budget(const char *host, int port, int enhanced) {
+    static long cached = -1;            /* atomics: also called from the Enhanced worker threads */
+    long budget_ms = __atomic_load_n(&cached, __ATOMIC_RELAXED);
+    if (budget_ms < 0) {
+        const char *e = getenv("IT305_CONNECT_TIMEOUT_S");
+        long v = e ? atol(e) : 10;
+        budget_ms = (v < 0 ? 0 : v) * 1000;
+        __atomic_store_n(&cached, budget_ms, __ATOMIC_RELAXED);
+    }
+    uint64_t t0 = monotonic_ns();
+    int warned = 0;
+    for (;;) {
+        int sock = connect_to_server(host, port, enhanced);
+        if (sock >= 0) return sock;
+        if (sock == -2) return -1;      /* host name does not resolve: retrying cannot help */
+        long waited_ms = (long)((monotonic_ns() - t0) / 1000000ull);
+        if (waited_ms >= budget_ms) {
+            fprintf(stderr, "Cannot connect to %s:%d after %.0f s (server not running, wrong address/port, or blocked by a firewall?)\n",
+                    host, port, waited_ms / 1000.0);
+            return -1;
+        }
+        if (!warned) { fprintf(stderr, "Cannot connect to %s:%d yet; retrying for up to %ld s\n", host, port, budget_ms / 1000); warned = 1; }
+        sleep_ms(100);
+    }
 }
 
 static int remove_tree(const char *path) {
@@ -375,8 +406,8 @@ static int client_restart_mode(const char *host, int port, const char *topic,
             retries++;
             if (remove_tree(topic_dir) != 0 || it305_mkdir_p(topic_dir, 0755) != 0) { perror("reset topic directory"); break; }
         }
-        int sock = connect_to_server(host, port, 0);
-        if (sock < 0) { fprintf(stderr, "connect failed; retrying\n"); sleep_ms(100); continue; }
+        int sock = connect_with_budget(host, port, 0);
+        if (sock < 0) break;                          /* gave up: exit code 1 */
         if (send_get(sock, topic) != 0) { close(sock); sleep_ms(reconnect_delay_ms()); continue; }
         uint64_t this_attempt = 0;
         rc = receive_topic_stream(sock, case_id, topic, topic_dir, checkpoint_path, NULL, &received, &this_attempt);
@@ -416,8 +447,8 @@ static int client_resume_mode(const char *host, int port, const char *topic,
     }
     int rc = -1;
     for (unsigned long attempt = 0; attempt < MAX_RETRIES; ++attempt) {
-        int sock = connect_to_server(host, port, 0);
-        if (sock < 0) { retries++; sleep_ms(100); continue; }
+        int sock = connect_with_budget(host, port, 0);
+        if (sock < 0) break;                          /* gave up: exit code 1 */
         int send_rc = (has_cp && cp.filename[0]) ? send_resume(sock, topic, cp.filename, cp.offset) : send_get(sock, topic);
         if (send_rc != 0) { close(sock); retries++; continue; }
         uint64_t this_attempt = 0;
@@ -452,7 +483,7 @@ static int client_resume_mode(const char *host, int port, const char *topic,
 
 static int request_manifest(const char *host, int port, const char *topic, int *sock_out,
                             EnhancedEntry **entries_out, size_t *count_out) {
-    int sock = connect_to_server(host, port, 1);
+    int sock = connect_with_budget(host, port, 1);
     if (sock < 0) return -1;
     if (it305_send_frame(sock, MSG_CMD_MANIFEST, 0, 0, topic, (uint32_t)strlen(topic)) != 0) { close(sock); return -1; }
     It305Frame f;
@@ -557,117 +588,177 @@ static void update_enhanced_entry(EnhancedContext *ctx, EnhancedEntry *e, uint64
     if (completed) journal_append_done(ctx, e->filename);
 }
 
-static int download_enhanced_file(EnhancedContext *ctx, EnhancedEntry *e, int *socket_io) {
-    for (unsigned long attempt = 0; attempt < MAX_RETRIES; ++attempt) {
-        pthread_mutex_lock(&e->mutex);
-        uint64_t offset = e->bytes_received;
-        int completed = e->completed;
-        pthread_mutex_unlock(&e->mutex);
-        if (completed) return 0;
-        if (offset > e->file_size) { offset = 0; update_enhanced_entry(ctx, e, 0, 0); }
-        int sock = *socket_io;
-        if (sock < 0) {
-            sock = connect_to_server(ctx->server_ip, ctx->port, 1);
-            if (sock < 0) { __sync_add_and_fetch(&ctx->retries, 1); sleep_ms(100); continue; }
-            *socket_io = sock;
-        }
-        int send_rc = offset ? send_resume(sock, ctx->topic, e->filename, offset)
-                             : send_get_file(sock, ctx->topic, e->filename);
-        if (send_rc != 0) { close(sock); *socket_io = -1; __sync_add_and_fetch(&ctx->retries, 1); continue; }
+/* ---- Enhanced worker: pipelined per-file requests over one persistent connection --------------------------------
+ * A worker keeps up to W file requests in flight on its connection (W = IT305_ENH_WINDOW, default 8). The server
+ * answers requests strictly in order, so while file N is still being received the requests for N+1..N+W-1 are
+ * already queued at the server and the connection never idles for a round trip between files. Stop-and-wait (one
+ * request, wait for the whole reply, next request) costs one RTT per file, which on a topic of thousands of small
+ * images is slower than a single streaming connection as soon as there is any network latency.
+ * After a dropped connection only the head file can have partial progress; it is resumed with CMD_RESUME and the
+ * remaining in-flight files are simply requested again from byte 0. */
+#define ENH_MAX_WINDOW 64
 
-        char filename[IT305_MAX_FILENAME + 1] = "";
-        uint64_t file_size = 0, current_offset = offset;
-        int file_fd = -1, received_header = 0, finished = 0, restart_from_zero = 0;
-        char path[PATH_MAX];
-        if (it305_path_join(path, sizeof(path), ctx->topic_dir, e->filename) != 0) { close(sock); return -1; }
-        for (;;) {
-            It305Frame f;
-            int rr = it305_recv_frame(sock, &f);
-            if (rr != 1) break;
-            if (f.type == MSG_ERR_BAD_OFFSET) {
-                it305_frame_free(&f);
-                restart_from_zero = 1;
-                break;
-            }
-            if (f.type == MSG_ERR_NOT_FOUND || f.type == MSG_ERR_PROTOCOL) {
-                fprintf(stderr, "Enhanced transfer error for %s\n", e->filename);
-                it305_frame_free(&f); close(sock); *socket_io = -1; if (file_fd >= 0) close(file_fd); return -1;
-            }
-            if (f.type == MSG_FILE_COMPLETE) {
-                it305_frame_free(&f);
-                if (file_fd >= 0) { close(file_fd); file_fd = -1; }
-                update_enhanced_entry(ctx, e, e->file_size, 1);
-                finished = 1;
-                break;
-            }
-            if (f.type == MSG_FILE_HEADER) {
-                if (parse_file_header(&f, filename, sizeof(filename), &file_size, &current_offset) != 0 ||
-                    strcmp(filename, e->filename) != 0 || file_size != e->file_size || current_offset != offset) {
-                    it305_frame_free(&f); if (file_fd >= 0) close(file_fd); close(sock); *socket_io = -1; return -1;
-                }
-                file_fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
-                if (file_fd < 0) { perror("open enhanced output file"); it305_frame_free(&f); close(sock); *socket_io = -1; return -1; }
-                if (offset == 0 && ftruncate(file_fd, 0) != 0) { close(file_fd); close(sock); *socket_io = -1; it305_frame_free(&f); return -1; }
-                received_header = 1;
-                it305_frame_free(&f);
-                continue;
-            }
-            if (f.type == MSG_FILE_DATA) {
-                if (!received_header || file_fd < 0 || f.length > IT305_CHUNK_SIZE || current_offset + f.length > file_size) {
-                    it305_frame_free(&f); break;
-                }
-                if (f.length && write_at(file_fd, f.payload, f.length, current_offset) != 0) {
-                    it305_frame_free(&f); close(file_fd); close(sock); *socket_io = -1; return -1;
-                }
-                current_offset += f.length;
-                __sync_add_and_fetch(&ctx->received_payload_bytes, f.length);
-                __sync_add_and_fetch(&ctx->useful_payload_bytes, f.length);
-                update_enhanced_entry(ctx, e, current_offset, 0);
-                int is_final = (f.flags & MSG_FLAG_FINAL_CHUNK) != 0;
-                it305_frame_free(&f);
-                if (is_final && current_offset != file_size) { close(file_fd); file_fd = -1; break; }
-                continue;
-            }
-            it305_frame_free(&f);
-            break;
-        }
-        if (file_fd >= 0) close(file_fd);
-        if (finished) return 0; /* reuse this worker's TCP connection for the next queued file */
-        close(sock);
-        *socket_io = -1;
-        if (restart_from_zero) {
-            int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0644);
-            if (fd >= 0) close(fd);
-            update_enhanced_entry(ctx, e, 0, 0);
-        }
-        __sync_add_and_fetch(&ctx->retries, 1);
-        sleep_ms(reconnect_delay_ms());
+static int enh_window(void) {
+    static int cached = 0;             /* atomics: called from every worker thread */
+    int v = __atomic_load_n(&cached, __ATOMIC_RELAXED);
+    if (!v) {
+        const char *e = getenv("IT305_ENH_WINDOW");
+        v = e ? atoi(e) : 8;
+        if (v < 1) v = 1;
+        if (v > ENH_MAX_WINDOW) v = ENH_MAX_WINDOW;
+        __atomic_store_n(&cached, v, __ATOMIC_RELAXED);
     }
-    return -1;
+    return v;
 }
 
-static void *enhanced_worker(void *arg) {
-    EnhancedWorkerArgs *wa = (EnhancedWorkerArgs *)arg;
-    EnhancedContext *ctx = wa->ctx;
-    int worker_socket = -1;
-    free(wa);
+/* next entry of the shared queue that is not already complete, or -1 */
+static long enh_claim(EnhancedContext *ctx) {
     for (;;) {
         pthread_mutex_lock(&ctx->queue_mutex);
-        if (ctx->failed || ctx->next_entry >= ctx->entry_count) {
-            pthread_mutex_unlock(&ctx->queue_mutex); break;
-        }
+        if (__atomic_load_n(&ctx->failed, __ATOMIC_RELAXED) || ctx->next_entry >= ctx->entry_count) { pthread_mutex_unlock(&ctx->queue_mutex); return -1; }
         size_t i = ctx->next_entry++;
         pthread_mutex_unlock(&ctx->queue_mutex);
         pthread_mutex_lock(&ctx->entries[i].mutex);
         int done = ctx->entries[i].completed;
         pthread_mutex_unlock(&ctx->entries[i].mutex);
-        if (done) continue;
-        if (download_enhanced_file(ctx, &ctx->entries[i], &worker_socket) != 0) {
-            pthread_mutex_lock(&ctx->queue_mutex); ctx->failed = 1; pthread_mutex_unlock(&ctx->queue_mutex);
-            break;
-        }
+        if (!done) return (long)i;
     }
-    if (worker_socket >= 0) close(worker_socket);
+}
+
+static int enh_send_request(EnhancedContext *ctx, EnhancedEntry *e, int sock) {
+    pthread_mutex_lock(&e->mutex);
+    uint64_t off = e->bytes_received;
+    pthread_mutex_unlock(&e->mutex);
+    return off ? send_resume(sock, ctx->topic, e->filename, off) : send_get_file(sock, ctx->topic, e->filename);
+}
+
+enum { ENH_DONE = 1, ENH_LOST = 0, ENH_FATAL = -1, ENH_RESTART = 2 };
+
+/* Receive the reply for entry e (which must be the oldest outstanding request on this connection). */
+static int enh_receive_file(EnhancedContext *ctx, EnhancedEntry *e, int sock) {
+    pthread_mutex_lock(&e->mutex);
+    uint64_t offset = e->bytes_received;
+    pthread_mutex_unlock(&e->mutex);
+    char path[PATH_MAX];
+    if (it305_path_join(path, sizeof(path), ctx->topic_dir, e->filename) != 0) return ENH_FATAL;
+    char filename[IT305_MAX_FILENAME + 1] = "";
+    uint64_t file_size = 0, current_offset = offset;
+    int file_fd = -1, got_header = 0, rc = ENH_LOST;
+    for (;;) {
+        It305Frame f;
+        if (it305_recv_frame(sock, &f) != 1) { rc = ENH_LOST; break; }
+        if (f.type == MSG_ERR_BAD_OFFSET) { it305_frame_free(&f); rc = ENH_RESTART; break; }
+        if (f.type == MSG_ERR_NOT_FOUND || f.type == MSG_ERR_PROTOCOL) {
+            fprintf(stderr, "Enhanced transfer error for %s\n", e->filename);
+            it305_frame_free(&f); rc = ENH_FATAL; break;
+        }
+        if (f.type == MSG_FILE_COMPLETE) {
+            it305_frame_free(&f);
+            update_enhanced_entry(ctx, e, e->file_size, 1);
+            rc = ENH_DONE; break;
+        }
+        if (f.type == MSG_FILE_HEADER) {
+            if (parse_file_header(&f, filename, sizeof(filename), &file_size, &current_offset) != 0 ||
+                strcmp(filename, e->filename) != 0 || file_size != e->file_size || current_offset != offset) {
+                it305_frame_free(&f); rc = ENH_FATAL; break;
+            }
+            it305_frame_free(&f);
+            if (file_fd >= 0) close(file_fd);
+            file_fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+            if (file_fd < 0) { perror("open enhanced output file"); rc = ENH_FATAL; break; }
+            if (offset == 0 && ftruncate(file_fd, 0) != 0) { rc = ENH_FATAL; break; }
+            got_header = 1;
+            continue;
+        }
+        if (f.type == MSG_FILE_DATA) {
+            if (!got_header || file_fd < 0 || f.length > IT305_CHUNK_SIZE || current_offset + f.length > file_size) {
+                it305_frame_free(&f); rc = ENH_LOST; break;
+            }
+            if (f.length && write_at(file_fd, f.payload, f.length, current_offset) != 0) {
+                it305_frame_free(&f); rc = ENH_FATAL; break;
+            }
+            current_offset += f.length;
+            __sync_add_and_fetch(&ctx->received_payload_bytes, f.length);
+            __sync_add_and_fetch(&ctx->useful_payload_bytes, f.length);
+            update_enhanced_entry(ctx, e, current_offset, 0);
+            it305_frame_free(&f);
+            continue;
+        }
+        it305_frame_free(&f);
+        rc = ENH_LOST; break;
+    }
+    if (file_fd >= 0) close(file_fd);
+    return rc;
+}
+
+/* One line per lost connection, like the Case 1/Case 2 clients print, so a live demo shows the recovery. */
+static void enh_note_loss(EnhancedContext *ctx, long head_index, int in_flight) {
+    EnhancedEntry *e = &ctx->entries[head_index];
+    pthread_mutex_lock(&e->mutex);
+    unsigned long long off = e->bytes_received;
+    pthread_mutex_unlock(&e->mutex);
+    fprintf(stderr, "Connection interrupted; resuming %s at offset %llu (%d request(s) re-issued)\n",
+            e->filename, off, in_flight);
+}
+
+static void enh_fail(EnhancedContext *ctx) {
+    pthread_mutex_lock(&ctx->queue_mutex);
+    __atomic_store_n(&ctx->failed, 1, __ATOMIC_RELAXED);      /* read without the lock by the other workers */
+    pthread_mutex_unlock(&ctx->queue_mutex);
+}
+
+static void *enhanced_worker(void *arg) {
+    EnhancedWorkerArgs *wa = (EnhancedWorkerArgs *)arg;
+    EnhancedContext *ctx = wa->ctx;
+    free(wa);
+    const int W = enh_window();
+    long ring[ENH_MAX_WINDOW];
+    int head = 0, count = 0, sock = -1;
+    unsigned long consecutive_losses = 0;
+    for (;;) {
+        if (__atomic_load_n(&ctx->failed, __ATOMIC_RELAXED)) break;
+        /* keep the pipeline full: claim more files and, if connected, send their requests immediately */
+        while (count < W) {
+            long i = enh_claim(ctx);
+            if (i < 0) break;
+            ring[(head + count) % ENH_MAX_WINDOW] = i;
+            count++;
+            if (sock >= 0 && enh_send_request(ctx, &ctx->entries[i], sock) != 0) {
+                /* with pipelining a dropped connection is usually noticed here, while sending, not while receiving */
+                close(sock); sock = -1;
+                __sync_add_and_fetch(&ctx->retries, 1);
+                enh_note_loss(ctx, ring[head], count);
+                break;
+            }
+        }
+        if (count == 0) break;                       /* queue drained and nothing in flight */
+        if (sock < 0) {                              /* (re)connect and re-issue every outstanding request in order */
+            sock = connect_with_budget(ctx->server_ip, ctx->port, 1);
+            if (sock < 0) { enh_fail(ctx); break; }       /* server gone for longer than the connection budget */
+            for (int k = 0; k < count; ++k) {
+                if (enh_send_request(ctx, &ctx->entries[ring[(head + k) % ENH_MAX_WINDOW]], sock) != 0) { close(sock); sock = -1; break; }
+            }
+            if (sock < 0) { __sync_add_and_fetch(&ctx->retries, 1); continue; }
+        }
+        EnhancedEntry *e = &ctx->entries[ring[head]];
+        int rc = enh_receive_file(ctx, e, sock);
+        if (rc == ENH_DONE) { head = (head + 1) % ENH_MAX_WINDOW; count--; consecutive_losses = 0; continue; }
+        close(sock); sock = -1;
+        if (rc == ENH_FATAL) { enh_fail(ctx); break; }
+        if (rc == ENH_LOST) enh_note_loss(ctx, ring[head], count);
+        if (rc == ENH_RESTART) {                     /* server rejected our resume offset: drop partial data, start the file over */
+            char path[PATH_MAX];
+            if (it305_path_join(path, sizeof(path), ctx->topic_dir, e->filename) == 0) {
+                int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0644);
+                if (fd >= 0) close(fd);
+            }
+            update_enhanced_entry(ctx, e, 0, 0);
+        }
+        __sync_add_and_fetch(&ctx->retries, 1);
+        if (++consecutive_losses > MAX_RETRIES) { enh_fail(ctx); break; }
+        sleep_ms(reconnect_delay_ms());
+    }
+    if (sock >= 0) close(sock);
     return NULL;
 }
 

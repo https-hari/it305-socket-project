@@ -17,8 +17,16 @@ results = []
 _port = [20000 + (os.getpid() % 2000) * 10]
 
 def port():
-    _port[0] += 1
-    return _port[0]
+    """next TCP port that is actually free (a stale listener must not make a check fail or hang)"""
+    while True:
+        _port[0] += 1
+        probe = socket.socket()
+        try:
+            probe.bind(("0.0.0.0", _port[0])); return _port[0]
+        except OSError:
+            continue
+        finally:
+            probe.close()
 
 def report(name, ok, detail=""):
     results.append(ok)
@@ -48,8 +56,10 @@ def result_of(stdout):
 
 def start_server(part, root, args, quiet=True):
     p = port()
+    errlog = tempfile.mktemp(suffix=".err")
     srv = subprocess.Popen([f"{ROOT}/{part}/server", str(p), root] + args, stdout=subprocess.PIPE,
-                           stderr=subprocess.DEVNULL, text=True)
+                           stderr=open(errlog, "w"), text=True)
+    srv.errlog = errlog
     for _ in range(100):                       # wait until it accepts connections
         try:
             socket.create_connection(("127.0.0.1", p), timeout=0.2).close(); break
@@ -61,6 +71,10 @@ def stop_server(srv):
     srv.send_signal(signal.SIGINT)
     try: out, _ = srv.communicate(timeout=15)
     except subprocess.TimeoutExpired: srv.kill(); out, _ = srv.communicate()
+    try:
+        srv.faults = open(srv.errlog).read().count("FAULT_INJECTION"); os.unlink(srv.errlog)
+    except OSError:
+        srv.faults = -1
     return out
 
 def run_clients(part, root, args, topics, extra=(), timeout=180):
@@ -78,6 +92,7 @@ def run_clients(part, root, args, topics, extra=(), timeout=180):
         ok += (c.returncode == 0 and os.path.isdir(f"{out}/{i}/{t}") and same_dir(src, f"{out}/{i}/{t}"))
     wall = time.time() - t0
     stop_server(srv); shutil.rmtree(out, ignore_errors=True)
+    run_clients.last_faults = srv.faults          # faults the server injected during this run
     return ok, rs, wall
 
 def raw_request(p, mtype, payload=b""):
@@ -105,6 +120,9 @@ def main():
         ok, rs, wall = run_clients(part, root, sargs, topics, cargs)
         report(f"{part} {' '.join(sargs)} {('K=' + cargs[0]) if cargs else ''} x{len(topics)} clients byte-identical",
                ok == len(topics), f"{ok}/{len(topics)} ok, {wall:.2f}s, retries(client0)={rs[0].get('retries', '?')}")
+        if part != "Part1":     # every fault the server injects must show up as exactly one reconnect at the clients
+            seen = sum(int(r.get("retries", 0)) for r in rs); injected = run_clients.last_faults
+            report(f"  counters agree: server injected {injected} faults, clients counted {seen} reconnects", injected == seen)
     # 2 --- case-insensitive topic, unknown topic
     ok, _, _ = run_clients("Part1", root, ["multi"], [a.topic.upper()])
     report("topic lookup is case-insensitive (CANE -> cane)", ok == 1)

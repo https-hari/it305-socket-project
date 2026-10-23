@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,10 +61,53 @@ typedef struct {
     unsigned int seed;
 } WorkerArgs;
 
+/* Flags set by signal handlers and read by the accept loop. They are accessed with atomics (C11 data-race freedom) and the
+   signals are blocked in every worker thread, so only the main thread runs the handlers and accept() is the call that gets
+   interrupted. */
 static volatile sig_atomic_t g_stop = 0;
+static volatile sig_atomic_t g_reload = 0;   /* set by SIGHUP; acted on by the accept loop */
 static int g_listen_fd = -1;
 static int g_enhanced_sendfile = 1; /* Enhanced only: 1 = sendfile() zero-copy, 0 = pread()+send (ablation baseline) */
 static int g_active_workers = 0;   /* connections currently being served (for graceful shutdown) */
+
+/* ---- structured event log -----------------------------------------------------------------------------------
+ * "<timestamp ms> [thread] [client ip:port] ACTION details" on stderr and, if IT305_LOG_FILE is set, appended to
+ * that file (line-flushed). IT305_LOG_LEVEL=debug additionally logs every connection and request. */
+static pthread_mutex_t g_log_mu = PTHREAD_MUTEX_INITIALIZER;
+static FILE *g_log_file = NULL;
+static int g_log_debug = 0;
+
+static void log_event(int debug_only, const char *action, int sock, const char *fmt, ...) {
+    if (debug_only && !g_log_debug) return;
+    char who[64] = "-";
+    if (sock >= 0) {
+        struct sockaddr_in in; socklen_t sl = sizeof(in);
+        if (getpeername(sock, (struct sockaddr *)&in, &sl) == 0 && in.sin_family == AF_INET) {
+            char ip[INET_ADDRSTRLEN];
+            if (inet_ntop(AF_INET, &in.sin_addr, ip, sizeof(ip))) snprintf(who, sizeof(who), "%s:%u", ip, (unsigned)ntohs(in.sin_port));
+        }
+    }
+    struct timespec ts; struct tm tmv; char stamp[40];
+    clock_gettime(CLOCK_REALTIME, &ts);
+    localtime_r(&ts.tv_sec, &tmv);
+    strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%S", &tmv);
+    char msg[512];
+    va_list ap; va_start(ap, fmt); vsnprintf(msg, sizeof(msg), fmt, ap); va_end(ap);
+    pthread_mutex_lock(&g_log_mu);
+    fprintf(stderr, "%s.%03ld [thread %lx] [%s] %s %s\n", stamp, ts.tv_nsec / 1000000, (unsigned long)pthread_self(), who, action, msg);
+    fflush(stderr);
+    if (g_log_file) {
+        fprintf(g_log_file, "%s.%03ld [thread %lx] [%s] %s %s\n", stamp, ts.tv_nsec / 1000000, (unsigned long)pthread_self(), who, action, msg);
+        fflush(g_log_file);
+    }
+    pthread_mutex_unlock(&g_log_mu);
+}
+
+static uint64_t realtime_ns(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 
 static uint64_t monotonic_ns(void) {
     struct timespec ts;
@@ -132,7 +176,7 @@ static int scan_topic_directory(TopicRecord *t) {
         if (rc != 0) { closedir(dir); return -1; }
     }
     closedir(dir);
-    qsort(t->files, t->file_count, sizeof(*t->files), cmp_file_meta);
+    if (t->file_count > 1) qsort(t->files, t->file_count, sizeof(*t->files), cmp_file_meta);   /* files is NULL for an empty topic: qsort(NULL,..) is undefined */
     return 0;
 }
 
@@ -175,7 +219,7 @@ static int registry_load(TopicRegistry *r, const char *root) {
         r->count++;
     }
     closedir(dir);
-    qsort(r->topics, r->count, sizeof(*r->topics), cmp_topic_meta);
+    if (r->count > 1) qsort(r->topics, r->count, sizeof(*r->topics), cmp_topic_meta);
     size_t hcap = 16;
     while (hcap < r->count * 2 + 1) hcap <<= 1;
     r->hash_slots = calloc(hcap, sizeof(*r->hash_slots));
@@ -191,6 +235,39 @@ static int registry_load(TopicRegistry *r, const char *root) {
         fprintf(stdout, "[TOPIC] name=%s files=%zu bytes=%llu\n", r->topics[i].topic_name,
                 r->topics[i].file_count, (unsigned long long)r->topics[i].total_size_bytes);
     fflush(stdout);
+    return 0;
+}
+
+/* ---- SIGHUP reload ---------------------------------------------------------------------------------------------
+ * The topic directory is re-scanned and swapped in under the write lock. Transfers that are already running keep
+ * pointers into the previous generation, so it must not be freed while any connection exists. Retired generations are
+ * therefore released as soon as the server is idle (checked at every reload and at shutdown). */
+typedef struct { TopicRecord *topics; size_t count; size_t *slots; } RetiredGen;
+static RetiredGen *g_retired = NULL;
+static size_t g_retired_n = 0;
+
+static void free_retired(void) {
+    for (size_t i = 0; i < g_retired_n; ++i) {
+        for (size_t j = 0; j < g_retired[i].count; ++j) free(g_retired[i].topics[j].files);
+        free(g_retired[i].topics); free(g_retired[i].slots);
+    }
+    free(g_retired); g_retired = NULL; g_retired_n = 0;
+}
+
+static int registry_reload(TopicRegistry *r, const char *root, int active_workers) {
+    TopicRegistry fresh;
+    if (registry_load(&fresh, root) != 0) return -1;     /* keep serving the old topics if the scan fails */
+    pthread_rwlock_wrlock(&r->rwlock);
+    RetiredGen *tmp = realloc(g_retired, (g_retired_n + 1) * sizeof(*g_retired));
+    if (tmp) {
+        g_retired = tmp;
+        g_retired[g_retired_n++] = (RetiredGen){ r->topics, r->count, r->hash_slots };
+    }                                                    /* if realloc failed the old generation simply leaks */
+    r->topics = fresh.topics; r->count = fresh.count; r->capacity = fresh.capacity;
+    r->hash_slots = fresh.hash_slots; r->hash_capacity = fresh.hash_capacity;
+    pthread_rwlock_unlock(&r->rwlock);
+    pthread_rwlock_destroy(&fresh.rwlock);
+    if (active_workers == 0) free_retired();             /* nobody can still be using an old generation */
     return 0;
 }
 
@@ -228,6 +305,7 @@ static long find_file_index(const TopicRecord *t, const char *name) {
 }
 
 static void send_error(int sock, uint8_t type, uint16_t status, const char *msg) {
+    log_event(0, "ERROR_REPLY", sock, "type=0x%02x status=%u reason=\"%s\"", (unsigned)type, (unsigned)status, msg ? msg : "");
     size_t n = strlen(msg);
     if (n > 1024) n = 1024;
     (void)it305_send_frame(sock, type, 0, status, msg, (uint32_t)n);
@@ -237,9 +315,8 @@ static int fault_now(int sock, double p, unsigned int *seed, const char *filenam
     if (p <= 0.0) return 0;
     double r = (double)rand_r(seed) / ((double)RAND_MAX + 1.0);
     if (r >= p) return 0;
-    fprintf(stderr, "[FAULT_INJECTION] drop file=%s offset=%llu probability=%.6f\n",
-            filename ? filename : "(none)", (unsigned long long)offset, p);
-    fflush(stderr);
+    log_event(0, "FAULT_INJECTION", sock, "drop file=%s offset=%llu probability=%.6f",
+              filename ? filename : "(none)", (unsigned long long)offset, p);
     struct linger sl;
     sl.l_onoff = 1;
     sl.l_linger = 0;
@@ -394,6 +471,8 @@ static int handle_request(int sock, WorkerArgs *w, It305Frame *req, uint64_t *da
         }
         int one_file = (w->case_id == CASE_ENHANCED);
         int rc;
+        log_event(0, "RESUME", sock, "topic=%s file=%s offset=%llu of %llu bytes", topic, filename,
+                  (unsigned long long)offset, (unsigned long long)t->files[idx].file_size);
         if (offset == t->files[idx].file_size) {
             if (one_file) return it305_send_frame(sock, MSG_FILE_COMPLETE, 0, 0, NULL, 0);
             rc = send_topic(sock, t, (size_t)idx + 1, 0, 0, w->case_id, w->failure_probability, &w->seed, data_bytes);
@@ -446,13 +525,21 @@ static void *client_worker(void *arg) {
     if (case_id == CASE_ENHANCED) (void)it305_set_socket_buffers(sock, 256 * 1024);
     uint64_t started = monotonic_ns();
     uint64_t bytes = 0;
+    log_event(1, "CONNECT", sock, "case=%d", case_id);
+    /* Active send window: first request received -> last reply finished. This is the "time required to send
+       data to the requesting client" of the handout; it excludes idle time before the first request and while
+       waiting for the client to close. */
+    uint64_t first_req = 0, last_done = 0, first_req_wall = 0, last_done_wall = 0;
     for (;;) {
         It305Frame req;
         int rc = it305_recv_frame(sock, &req);
         if (rc <= 0) break;
+        if (!first_req) { first_req = monotonic_ns(); first_req_wall = realtime_ns(); }
+        log_event(1, "REQUEST", sock, "opcode=0x%02x payload=%u bytes", (unsigned)req.type, (unsigned)req.length);
         WorkerArgs local = { .sock = sock, .case_id = case_id, .failure_probability = p,
                              .registry = registry, .seed = seed };
         int hrc = handle_request(sock, &local, &req, &bytes);
+        last_done = monotonic_ns(); last_done_wall = realtime_ns();
         seed = local.seed;
         uint8_t type = req.type;
         it305_frame_free(&req);
@@ -465,17 +552,22 @@ static void *client_worker(void *arg) {
     }
     uint64_t ended = monotonic_ns();
     double elapsed = ended > started ? (double)(ended - started) / 1e9 : 0.0;
-    fprintf(stdout, "SERVER_METRIC,case=%d,data_bytes=%llu,elapsed_sec=%.9f\n",
-            case_id, (unsigned long long)bytes, elapsed);
+    log_event(1, "CLOSE", sock, "data_bytes=%llu connection_seconds=%.3f", (unsigned long long)bytes, elapsed);
+    double send_sec = (first_req && last_done > first_req) ? (double)(last_done - first_req) / 1e9 : 0.0;
+    fprintf(stdout, "SERVER_METRIC,case=%d,data_bytes=%llu,elapsed_sec=%.9f,send_sec=%.9f,start_unix_ns=%llu,end_unix_ns=%llu\n",
+            case_id, (unsigned long long)bytes, elapsed, send_sec,
+            (unsigned long long)first_req_wall, (unsigned long long)last_done_wall);
     fflush(stdout);
     close(sock);
     __atomic_sub_fetch(&g_active_workers, 1, __ATOMIC_SEQ_CST);
     return NULL;
 }
 
+static void reload_handler(int sig) { (void)sig; __atomic_store_n(&g_reload, 1, __ATOMIC_RELAXED); }
+
 static void stop_handler(int sig) {
     (void)sig;
-    g_stop = 1;
+    __atomic_store_n(&g_stop, 1, __ATOMIC_RELAXED);
     if (g_listen_fd >= 0) close(g_listen_fd);
 }
 
@@ -563,6 +655,17 @@ int it305_server_main(int argc, char **argv, int case_id) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    struct sigaction sh;                     /* SIGHUP: reload the topics directory (no SA_RESTART so accept() wakes up) */
+    memset(&sh, 0, sizeof(sh));
+    sh.sa_handler = reload_handler;
+    sigemptyset(&sh.sa_mask);
+    sigaction(SIGHUP, &sh, NULL);
+    const char *log_path = getenv("IT305_LOG_FILE");
+    if (log_path && *log_path) {
+        g_log_file = fopen(log_path, "a");
+        if (!g_log_file) fprintf(stderr, "WARNING: cannot open IT305_LOG_FILE '%s': %s\n", log_path, strerror(errno));
+    }
+    { const char *lv = getenv("IT305_LOG_LEVEL"); g_log_debug = lv && !strcasecmp(lv, "debug"); }
 
     g_listen_fd = make_listener(port);
     if (g_listen_fd < 0) { perror("listen socket"); free_registry(&registry); return 1; }
@@ -570,13 +673,21 @@ int it305_server_main(int argc, char **argv, int case_id) {
             port, case_id, (case_id == CASE_PART1 && !multi) ? "single" : "multi", fail_p,
             case_id == CASE_ENHANCED ? (g_enhanced_sendfile ? " data_path=sendfile" : " data_path=buffered") : "");
     fflush(stdout);
-    while (!g_stop) {
+    log_event(0, "SERVER_START", -1, "port=%d case=%d topics=%zu root=%s", port, case_id, registry.count, root);
+    while (!__atomic_load_n(&g_stop, __ATOMIC_RELAXED)) {
+        if (__atomic_load_n(&g_reload, __ATOMIC_RELAXED)) {
+            __atomic_store_n(&g_reload, 0, __ATOMIC_RELAXED);
+            if (registry_reload(&registry, root, __atomic_load_n(&g_active_workers, __ATOMIC_SEQ_CST)) == 0)
+                log_event(0, "RELOAD", -1, "SIGHUP: topics=%zu (active connections keep the topics they started with)", registry.count);
+            else
+                log_event(0, "RELOAD_FAILED", -1, "SIGHUP: rescan of '%s' failed, still serving the previous topics", root);
+        }
         struct sockaddr_in peer;
         socklen_t peer_len = sizeof(peer);
         int client_fd = accept(g_listen_fd, (struct sockaddr *)&peer, &peer_len);
         if (client_fd < 0) {
             if (errno == EINTR) continue;
-            if (g_stop || errno == EBADF || errno == EINVAL) break;
+            if (__atomic_load_n(&g_stop, __ATOMIC_RELAXED) || errno == EBADF || errno == EINVAL) break;
             perror("accept"); continue;
         }
         (void)it305_set_nodelay(client_fd);
@@ -596,7 +707,13 @@ int it305_server_main(int argc, char **argv, int case_id) {
             w->failure_probability = fail_p;
             w->seed = next_conn_seed();
             pthread_t tid;
-            if (pthread_create(&tid, NULL, client_worker, w) != 0) {
+            sigset_t blocked, previous;                  /* the new thread inherits this mask: workers never run the handlers */
+            sigemptyset(&blocked);
+            sigaddset(&blocked, SIGINT); sigaddset(&blocked, SIGTERM); sigaddset(&blocked, SIGHUP);
+            pthread_sigmask(SIG_BLOCK, &blocked, &previous);
+            int create_rc = pthread_create(&tid, NULL, client_worker, w);
+            pthread_sigmask(SIG_SETMASK, &previous, NULL);
+            if (create_rc != 0) {
                 close(client_fd); free(w); __atomic_sub_fetch(&g_active_workers, 1, __ATOMIC_SEQ_CST); continue;
             }
             pthread_detach(tid);
@@ -612,5 +729,8 @@ int it305_server_main(int argc, char **argv, int case_id) {
     }
     fprintf(stdout, "[SHUTDOWN] server stopped\n");
     fflush(stdout);
+    log_event(0, "SERVER_STOP", -1, "active_connections_left=%d", __atomic_load_n(&g_active_workers, __ATOMIC_SEQ_CST));
+    if (__atomic_load_n(&g_active_workers, __ATOMIC_SEQ_CST) == 0) free_retired();
+    if (g_log_file) { fclose(g_log_file); g_log_file = NULL; }
     return 0;
 }

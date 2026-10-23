@@ -94,7 +94,7 @@ The server checks that the topic and file exist, and rejects offsets beyond the 
 
 ### 4.3 Case 2 — Enhanced: manifest and parallel files
 
-The client first requests a manifest on a short-lived connection and parses all file names and sizes. Up to K workers (default K = 4; an optional trailing client argument can change it), each with its own persistent TCP connection, take whole files from a mutex-protected work queue. The per-file byte offset is kept in memory; after a dropped connection only that worker reconnects and resumes its file with `CMD_RESUME`, while the other workers continue. On disk, the client appends one line per completed file to an append-only journal (`.checkpoint.tmp`); progress inside an unfinished file is recovered from that file's length, because files are written strictly sequentially. Recording a completed file is therefore O(1) and no lock is shared between workers on the data path.
+The client first requests a manifest on a short-lived connection and parses all file names and sizes. Up to K workers (default K = 4; an optional trailing client argument can change it), each with its own persistent TCP connection, take whole files from a mutex-protected work queue. Each worker keeps up to eight file requests in flight on its connection (pipelining, `IT305_ENH_WINDOW`): the server answers requests in order, so the connection does not idle for a round trip between files. A first version used one request per file and waited for the reply; on a development machine with an emulated delay it was clearly slower than the single-connection streaming of Case 2 (4.5 s against 1.9 s at 1 ms one-way delay on an 85 MB, 3,000-file topic) because every file cost a round trip, and pipelining removed that penalty. These are software-emulation rehearsal figures, not lab measurements. The per-file byte offset is kept in memory; after a dropped connection only that worker reconnects and resumes its file with `CMD_RESUME`, while the other workers continue. On disk, the client appends one line per completed file to an append-only journal (`.checkpoint.tmp`); progress inside an unfinished file is recovered from that file's length, because files are written strictly sequentially. Recording a completed file is therefore O(1) and no lock is shared between workers on the data path.
 
 The server enlarges send and receive socket buffers to 256 KiB. For each `FILE_DATA` chunk it sends the 8-byte frame header with `MSG_MORE` (so the header leaves together with the payload) and then uses a bounded `sendfile()` for the payload. Bounding each sendfile operation at a 64-KiB chunk keeps fault-injection points aligned with the other cases. An optional server argument (`buffered`) switches to `pread()`+`send()` so the benefit of zero-copy can be measured separately from the benefit of parallel connections (vary K for the latter). File-level parallelism was selected instead of byte-range splitting because each topic contains many independent image files, avoiding out-of-order reassembly within one file.
 
@@ -120,45 +120,93 @@ The server enlarges send and receive socket buffers to 256 KiB. For each `FILE_D
 5. The Enhanced checkpoint (design section 4.2) is an append-only journal of completed files plus the on-disk length of unfinished files, instead of an array of per-file entries rewritten after every chunk; the rewrite was O(number of files) per chunk and serialised all workers behind one lock.
 6. Case 2 checkpoint updates no longer use a temporary file, `rename()` and `fsync()` per chunk; see the durability note in section 5.
 7. Added optional trailing server argument `sendfile|buffered` (Enhanced) so that the zero-copy enhancement can be isolated in the analysis.
+8. The Enhanced client pipelines up to eight requests per connection instead of one request per file (section 4.3); the server needed no change.
+9. Each `SERVER_METRIC` line also records the active send window (first request to last finished reply) so that the server-side aggregate rate required by the handout can be computed.
 
 ## 7. Verification performed during development
 
-The source is compiled with `-Wall -Wextra -Wpedantic` without warnings. `tools/verify.py` checks, for all four cases with six concurrent clients, that every downloaded file is byte-identical to the source with and without fault injection (including the 1-connection buffered Enhanced variant); that topics match case-insensitively and unknown topics fail cleanly; that the Part I and Case 1 servers refuse `CMD_RESUME`; that a client killed with `SIGKILL` in the middle of a transfer resumes from its checkpoint (Case 2 and Enhanced) and receives fewer bytes on the second run; and that `SIGINT` lets an in-flight transfer finish. The same suite was run under AddressSanitizer plus UndefinedBehaviorSanitizer, and the multi-threaded server and clients under ThreadSanitizer. AddressSanitizer found a one-byte stack-buffer overflow in checkpoint parsing (a 259-byte buffer for a `%259[^\n]` conversion), which is fixed.
+The source is compiled with `-Wall -Wextra -Wpedantic` without warnings. `tools/verify.py` (17 checks) checks, for all four cases with six concurrent clients, that every downloaded file is byte-identical to the source with and without fault injection (including the 1-connection buffered Enhanced variant); that topics match case-insensitively and unknown topics fail cleanly; that the number of faults the server injected equals the number of reconnects the clients counted; that the Part I and Case 1 servers refuse `CMD_RESUME`; that a client killed with `SIGKILL` in the middle of a transfer resumes from its checkpoint (Case 2 and Enhanced) and receives fewer bytes on the second run; and that `SIGINT` lets an in-flight transfer finish. The same suite was run under AddressSanitizer plus UndefinedBehaviorSanitizer, and the multi-threaded server and clients under ThreadSanitizer. AddressSanitizer found a one-byte stack-buffer overflow in checkpoint parsing (a 259-byte buffer for a `%259[^\n]` conversion), which is fixed.
 
 These tests were run on a single development machine over the loopback interface. They validate protocol and recovery behaviour only; they are **not** the required three-computer performance results and must not be used as the report's measured lab results.
 
-## 8. Performance analysis — replace all TBD values after measurement
+## 8. Performance analysis
 
-Use actual runs on the assigned three-computer setup. Vary the number of clients for Part I. For Part II, vary failure probability for Case 1, Case 2, and Case 2 Enhanced. At least record elapsed completion time, server data bytes sent, client payload bytes received, useful payload bytes, redundant bytes, retries, and throughput.
+The tables, graph references and the computed observations in this section are generated from `Results/raw_metrics.csv` by `tools/report_tables.py` (means over the repeats, mean ± standard deviation when there is more than one). The interpretation paragraphs are the authors' own.
+
+### 8.0 Experimental setup — TBD
+
+| Item | Value |
+|---|---|
+| Server computer | TBD (CPU, RAM, disk, operating system) |
+| Client computers (two) | TBD (CPU, RAM, operating system) |
+| Network | TBD (link speed, switch or Wi-Fi, same subnet or not) |
+| Dataset and topic used | TBD (topic name, number of files, total size in MB) |
+| Client counts, failure probabilities, repetitions | TBD |
+| Exact command line(s) used | TBD (paste the `benchmark.py` command) |
+| Cache state | The topic was read once before measuring (benchmark warm-up); results are means over repeated runs |
 
 Definitions:
 
-- **Useful throughput (B/s)** = useful payload bytes successfully delivered / elapsed wall-clock seconds.
-- **Retransmission overhead (%)** = 100 × redundant payload bytes / useful payload bytes.
+- **Aggregate throughput (client-measured)** = useful payload bytes of all clients ÷ the slowest client's own elapsed time.
+- **Aggregate throughput (server-measured)** = data bytes the server wrote ÷ the interval from the first request to the last finished reply, measured on the server with `clock_gettime` (the handout's "time required to send data").
+- **Redundant at the client** = payload bytes received that were not needed in the final files (received − useful).
+- **Server-sent excess** = bytes the server handed to the kernel beyond the useful payload. After a TCP reset, data still queued in the kernel is discarded and sent again, so this is wasted bandwidth that the client never sees.
+- **Retransmission overhead (%)** = 100 × redundant bytes ÷ useful bytes.
 
 ### 8.1 Part I: aggregate throughput vs. client count
 
-| Concurrent clients | Single-threaded aggregate throughput (MB/s) | Multi-threaded aggregate throughput (MB/s) | Observations |
-|---:|---:|---:|---|
-| 1 | TBD | TBD | TBD |
-| 2 | TBD | TBD | TBD |
-| 4 | TBD | TBD | TBD |
-| Other tested values | TBD | TBD | TBD |
+<!-- BEGIN:part1_table -->
+_Generated from the lab measurements: run `tools/build_report.sh` after the experiments._
+<!-- END:part1_table -->
 
-Insert `Results/Part1_throughput.png` generated from the final measurements. Explain whether multi-threading improved aggregate throughput under the tested network and dataset, and identify any bottleneck.
+**Analysis (Part I).** TBD — Did multi-threading improve aggregate throughput on this network and dataset? At which client count does the curve flatten and what is the bottleneck (link, server disk, server CPU, client disk)? Explain any case where the two servers look alike.
 
-### 8.2 Part II: measured metrics
+### 8.2 Part II: Case 1, Case 2 and Case 2 Enhanced under random connection drops
 
-Complete a separate table for each failure probability tested. The CSV should retain raw rows for each case, client count, and repetition.
+<!-- BEGIN:part2_headline -->
+_Generated from the lab measurements: run `tools/build_report.sh` after the experiments._
+<!-- END:part2_headline -->
 
-| Case | Failure probability | Client count | Wall time (s) | Server data bytes sent | Received payload bytes | Useful bytes | Redundant bytes | Retries | Aggregate throughput (MB/s) |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Case 1 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| Case 2 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| Case 2 Enhanced | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+**Analysis (Part II).** TBD — Compare Case 1 (restart from byte 0) with Case 2 (resume at the checkpoint): completion time, redundant bytes at the client, server-sent excess, number of reconnects. Say what happens to Case 1 as the failure probability grows, and relate it to the probability (1−p)^N that a transfer with N fault checks survives untouched.
 
-Insert the final `Part2_Case1_throughput.png`, `Part2_Case1_overhead.png`, `Part2_Case2_throughput.png`, `Part2_Case2_overhead.png`, `Part2_Case2_Enhanced_throughput.png`, and `Part2_Case2_Enhanced_overhead.png` graphs. In the analysis, compare the overhead and completion-time impact of restarting from zero against resuming at a durable byte offset, then discuss whether file-level parallelism improved throughput in the three-computer environment.
+Tables for the other client counts:
 
-## 9. Summary and conclusion — complete after measurement
+<!-- BEGIN:part2_all -->
+_Generated from the lab measurements: run `tools/build_report.sh` after the experiments._
+<!-- END:part2_all -->
 
-The implementation supports the four required scenarios and provides client-side progress persistence for recovery. The expected qualitative distinction is that Case 1 loses partial progress after a dropped connection, whereas Case 2 resumes a file at its checkpoint. Case 2 Enhanced additionally overlaps downloads of independent files and uses bounded sendfile transmission. The final conclusion must be grounded in the collected measurements: report whether observed throughput, retransmission overhead, and completion time support those expectations, and mention any surprising results or limitations.
+### 8.3 Comparison with Part I (no injected faults)
+
+<!-- BEGIN:vs_part1 -->
+_Generated from the lab measurements: run `tools/build_report.sh` after the experiments._
+<!-- END:vs_part1 -->
+
+**Analysis.** TBD — What does the session-management machinery (checkpoint writes, resume protocol, parallel connections) cost when no fault ever occurs?
+
+### 8.4 Enhancement study: parallel connections and zero-copy
+
+<!-- BEGIN:ablation -->
+_Generated from the lab measurements: run `tools/build_report.sh` after the experiments._
+<!-- END:ablation -->
+
+**Analysis.** TBD — Which enhancement helped on this network (number of parallel connections K, `sendfile` versus buffered `pread`/`send`), by how much, and why does it (not) help here? A single clean LAN connection is often not the bottleneck, so a small gain is a legitimate result as long as it is explained.
+
+### 8.5 Graphs
+
+<!-- BEGIN:graphs -->
+_Generated from the lab measurements: run `tools/build_report.sh` after the experiments._
+<!-- END:graphs -->
+
+### 8.6 Computed observations
+
+These statements are computed mechanically from the CSV; the authors checked them against the graphs.
+
+<!-- BEGIN:observations -->
+_Generated from the lab measurements: run `tools/build_report.sh` after the experiments._
+<!-- END:observations -->
+
+## 9. Summary and conclusion
+
+The implementation supports the four required scenarios, persists client progress for recovery, and the Enhanced variant overlaps downloads of independent files with pipelined requests and bounded `sendfile` transmission.
+
+**Conclusion.** TBD — State, grounded in section 8, whether the measured throughput, retransmission overhead and completion time support the expected behaviour (Case 1 loses partial progress, Case 2 resumes at the checkpoint, Enhanced helps when a single connection is the bottleneck). Mention surprising results and the limitations (for example: no content checksum on resume, blocking sockets with a thread per connection, measurements on one lab network).

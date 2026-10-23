@@ -34,8 +34,14 @@ FinalSubmission_Group_095_120/
 ├── Part2_Case1/                        # fault injection; restart the topic from byte zero
 ├── Part2_Case2/                        # resumable full-topic transfer with client checkpoint
 ├── Part2_Case2_Enhanced/               # manifest, K parallel file workers, resume, sendfile, socket tuning
+├── docs/
+│   └── LAB_AND_VIVA_GUIDE.md           # system overview, rehearsal, lab runbook, viva demo script and Q&A
 ├── tools/
-│   └── verify.py                       # end-to-end correctness / fault / crash-resume / shutdown checks
+│   ├── verify.py                       # 17 end-to-end checks: correctness, faults, crash-resume, shutdown
+│   ├── demo.py                         # narrated one-machine demo of all four ideas (viva backup)
+│   ├── rig.sh  docker-ssh              # three-container rehearsal of the three-PC setup (Docker)
+│   ├── netem_proxy.py                  # software delay / bandwidth-cap proxy (no root needed)
+│   └── lab_check.sh                    # pre-flight check to run on every lab PC
 └── Results/
     ├── raw_metrics.csv                 # header only until the lab experiments have been run
     ├── benchmark.py                    # experiment runner (local, ssh or manual) + graph generator
@@ -168,13 +174,26 @@ Optional K parallel file workers:
 ./client <server_ip> <server_port> <topic> <output_dir> 8
 ```
 
-The enhanced client fetches the manifest, assigns whole files through a mutex-protected queue, records each completed file in an append-only journal (`.checkpoint.tmp`, one `D<TAB>name` line per file; progress inside an unfinished file is recovered from its length on disk), and uses up to K persistent worker connections (plus one short-lived connection that fetches the manifest). A worker reconnects only if its connection fails. The enhanced server uses 256-KB socket buffers and bounded `sendfile()` payload sends while preserving the 8-byte header before every `FILE_DATA` payload.
+The enhanced client fetches the manifest, assigns whole files through a mutex-protected queue, records each completed file in an append-only journal (`.checkpoint.tmp`, one `D<TAB>name` line per file; progress inside an unfinished file is recovered from its length on disk), and uses up to K persistent worker connections (plus one short-lived connection that fetches the manifest). Each worker **pipelines** its requests: up to 8 file requests (`IT305_ENH_WINDOW`) are in flight on its connection, so it never waits a round trip between files; after a drop it resumes its current file with `CMD_RESUME` and re-requests the rest of its window. A worker reconnects only if its connection fails. The enhanced server uses 256-KB socket buffers and bounded `sendfile()` payload sends while preserving the 8-byte header before every `FILE_DATA` payload.
+
+### Fault-injection mechanism
+
+The server's `<failure_probability>` argument is the probability *p* that a connection is cut at each **fault check**. A check
+happens in the worker thread that serves the client: once right after a file's `FILE_HEADER` has been sent (before any data of
+that file) and again before every 64 KB `FILE_DATA` chunk. At each check the thread draws a uniform random number with `rand_r`
+(from its own per-connection seed) and, if it is below *p*, it sets `SO_LINGER` to `{on, 0}` and shuts the socket down. The worker
+then closes it, so the connection is aborted abruptly (the kernel discards unsent data) instead of finishing gracefully; the client
+sees an early end of stream or a reset in the middle of a transfer, as after a crashed link. The decision is made only on the server.
+The client just notices that the connection broke and recovers according to its case: Case 1 restarts the topic from byte 0, while
+Case 2 and Enhanced send `CMD_RESUME` with the file and byte offset they had reached. With `p = 0` the check does nothing, which is
+how Part I and the no-fault baselines run.
 
 Use a failure probability between `0.0` and `1.0`. The probability applies **per check**: once when a file starts and once before every 64 KB chunk. A transfer with N checks finishes without any fault with probability (1-p)^N, so on a topic with thousands of files Case 1 (which restarts from zero) practically never completes above p of about 2e-4; use values such as `0`, `1e-5`, `1e-4`, `2e-4`, or a smaller topic. A value of `1.0` drops every transfer and is not expected to complete.
 
 ### Behaviour worth knowing
 
 - **Connection lifetime.** Whole-topic replies (`CMD_GET`, `CMD_RESUME` in Part I / Case 1 / Case 2) end with `END_OF_TOPIC` and the server closes the connection. Only the Enhanced per-file protocol keeps a connection open for the next request.
+- **Server-side timing.** Each `SERVER_METRIC` line carries the connection's active send window (`send_sec`, `start_unix_ns`, `end_unix_ns`: first request to last finished reply, from `clock_gettime`); `benchmark.py` turns them into `server_window_sec` and `server_aggregate_throughput_Bps`.
 - **Fault injection RNG.** Every connection gets an independent seed (clock nanoseconds, pid and a connection counter mixed with splitmix64) for `rand_r`, so faults are independent across reconnects.
 - **Reconnect delay.** Clients reconnect immediately by default. Set `IT305_RECONNECT_DELAY_MS=<ms>` to add a back-off; if you do, state it in the report because it directly adds to completion time.
 - **Graceful shutdown.** `SIGINT`/`SIGTERM` stop accepting new connections; in-flight transfers are allowed to finish (up to about 10 s) before the server exits.
@@ -201,7 +220,7 @@ python3 tools/verify.py /path/to/raw-img
 It verifies, for all four cases and several concurrent clients, that downloads are byte-identical with and without fault
 injection; that topic names match case-insensitively and unknown topics fail cleanly; that Part I / Case 1 refuse
 `CMD_RESUME`; that a client killed with `SIGKILL` mid-transfer resumes (Case 2 and Enhanced) and receives fewer bytes
-on the second run; and that `SIGINT` drains in-flight transfers. Expect `13/13 checks passed`.
+on the second run; and that `SIGINT` drains in-flight transfers. Expect `17/17 checks passed`.
 
 Manual example:
 
@@ -262,7 +281,7 @@ docker build -t it305 .                                    # once
 docker run --rm -it -v "$PWD":/app -v "$HOME/Desktop/it305_data/raw-img":/data:ro it305
 #   inside the container:
 make                         # builds Part1, Part2_Case1, Part2_Case2, Part2_Case2_Enhanced
-make test                    # = python3 tools/verify.py /data   (expect: 13/13 checks passed)
+make test                    # = python3 tools/verify.py /data   (expect: 17/17 checks passed)
 ```
 
 Separate "machines" on one Mac (a user-defined network lets containers reach each other by name):
@@ -280,3 +299,15 @@ mkdir -p out && docker run --rm -it --network it305net -v "$PWD":/app -v "$PWD/o
 Numbers measured inside Docker Desktop on a laptop are **not** lab results: everything shares one machine and a virtual
 network. Use Docker for building, testing and understanding; take the report's measurements on the lab computers.
 Before submitting run `make clean` (the Linux binaries built in Docker are useless on a Mac and must not be in the zip).
+
+## 10. Testing alone, rehearsing, and the viva
+
+`docs/LAB_AND_VIVA_GUIDE.md` has the system explained on one page, the design alternatives, what results to expect, the lab-day
+runbook for three computers, a timed viva demo script and likely questions with answers. Tools for working alone:
+
+| Tool | Purpose |
+|---|---|
+| `tools/rig.sh up / test / shape / bench / down` | three Docker containers stand in for server + two client PCs; `bench` runs the same orchestrated experiment as the lab |
+| `tools/netem_proxy.py` | delay and per-connection bandwidth cap between client and server, no root (used by `demo.py`) |
+| `tools/demo.py --topics-root <dir>` | two-minute narrated demo: single vs multi, Case 1 vs 2 vs Enhanced, parallel connections, crash-resume |
+| `tools/lab_check.sh [server_ip port]` | run on every lab PC first: tools, build, loopback self-test, IP address, reachability of the server |

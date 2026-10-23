@@ -42,6 +42,8 @@ FIELDS = [
     "received_payload_bytes", "useful_payload_bytes", "redundant_payload_bytes",
     "retries", "source_bytes_per_client", "aggregate_throughput_Bps", "success",
     "server_log", "client_logs", "client_elapsed_sec_max", "client_nodes",
+    "server_window_sec", "server_aggregate_throughput_Bps",
+    "parallel_connections", "server_data_path", "label",
 ]
 
 
@@ -92,16 +94,36 @@ def source_topic_bytes(topics_root: Path, topic: str) -> int:
 
 
 def server_data_bytes(path: Path) -> int:
+    return server_metrics(path)[0]
+
+
+def server_metrics(path: Path) -> tuple[int, float]:
+    """(total data bytes the server wrote, seconds from the first request to the last finished reply).
+
+    The window is the span of the per-connection [first request, last reply] intervals the server logged with
+    clock_gettime, i.e. the handout's "time required to send data", so bytes/window is the server-side aggregate
+    transfer rate."""
     total = 0
-    pattern = re.compile(r"SERVER_METRIC,case=\d+,data_bytes=(\d+),")
+    first, last = None, None
+    pattern = re.compile(r"SERVER_METRIC,case=\d+,data_bytes=(\d+),[^\n]*?start_unix_ns=(\d+),end_unix_ns=(\d+)")
+    plain = re.compile(r"SERVER_METRIC,case=\d+,data_bytes=(\d+),")
     try:
         for line in path.read_text(errors="replace").splitlines():
             m = pattern.search(line)
             if m:
+                nbytes, t0, t1 = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                total += nbytes
+                if nbytes > 0 and t0 and t1 >= t0:
+                    first = t0 if first is None else min(first, t0)
+                    last = t1 if last is None else max(last, t1)
+                continue
+            m = plain.search(line)
+            if m:
                 total += int(m.group(1))
     except OSError:
         pass
-    return total
+    window = (last - first) / 1e9 if first is not None and last is not None and last > first else 0.0
+    return total, window
 
 
 def wait_until_ready(proc: subprocess.Popen[str], log_path: Path, timeout: float = 10.0) -> bool:
@@ -154,10 +176,30 @@ def dir_bytes(path: Path) -> int:
     return total
 
 
+def warm_cache(a, topics_root: Path | None, topic: str) -> None:
+    """Read the topic once on the server machine so that the first measured scenario does not pay for cold disk reads."""
+    if a.manual_server:
+        print("[warmup] skipped (manual server): on the server PC run  find <topics_root>/<topic> -type f -exec cat {} + > /dev/null")
+        return
+    if a.server_ssh:
+        remote = f"{shlex.quote(a.remote_topics or str(topics_root))}/{shlex.quote(topic)}"
+        subprocess.run(ssh_argv(a.server_ssh, f"find {remote} -type f -exec cat {{}} + > /dev/null"),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elif topics_root is not None and (topics_root / topic).is_dir():
+        for f in (topics_root / topic).iterdir():
+            if f.is_file():
+                with f.open("rb") as fh:
+                    while fh.read(1 << 20):
+                        pass
+    print(f"[warmup] topic '{topic}' read once into the server's page cache")
+
+
 def run_one_scenario(case_name: str, mode: str, client_count: int, failure_probability: float,
                      repeat_idx: int, port_start: int, topics_root: Path | None, topic: str, a) -> dict[str, Any]:
     case_dir = PROJECT_ROOT / case_name
     run_name = f"{case_name}_{mode}_clients{client_count}_p{failure_probability:g}_r{repeat_idx}"
+    if a.label:
+        run_name += "_" + "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in a.label)
     run_dir = RESULTS_DIR / "benchmark_runs" / run_name
     if run_dir.exists():
         shutil.rmtree(run_dir)
@@ -177,8 +219,14 @@ def run_one_scenario(case_name: str, mode: str, client_count: int, failure_proba
         if case_name == "Part2_Case2_Enhanced" and a.server_data_path:
             server_args.append(a.server_data_path)
     remote_case = f"{a.remote_dir.rstrip('/')}/{case_name}" if a.remote_dir else ""
-    peer_n = client_count // 2 if a.peer_ssh else 0
-    local_n = client_count - peer_n
+    # clients are spread round-robin over the client machines: this machine (unless --no-local-clients) and
+    # every --client-ssh / --peer-ssh node
+    node_list = ([None] if not a.no_local_clients else []) + list(a.client_ssh_list)
+    if not node_list:
+        raise RuntimeError("no machine to run clients on: pass --client-ssh or drop --no-local-clients")
+    assignment = [node_list[i % len(node_list)] for i in range(client_count)]
+    local_n = sum(1 for n in assignment if n is None)
+    remote_nodes = [n for n in node_list if n is not None]
     extra = [str(a.parallel_connections)] if case_name == "Part2_Case2_Enhanced" else []
 
     server: subprocess.Popen[str] | None = None
@@ -190,7 +238,7 @@ def run_one_scenario(case_name: str, mode: str, client_count: int, failure_proba
                   f"./server {' '.join(shlex.quote(x) for x in server_args)}")
             input(">>> Press Enter once it prints [LISTENING] ... ")
         elif a.server_ssh:
-            cmd = ssh_argv(a.server_ssh, f"cd {shlex.quote(remote_case)} && exec ./server "
+            cmd = ssh_argv(a.server_ssh, f"cd {shlex.quote(remote_case)} && echo $$ > /tmp/it305_server.pid && exec ./server "
                            + " ".join(shlex.quote(x) for x in server_args), tty=True)
             server_out = server_log.open("w", encoding="utf-8")
             server = subprocess.Popen(cmd, stdout=server_out, stderr=subprocess.STDOUT, text=True)
@@ -207,7 +255,8 @@ def run_one_scenario(case_name: str, mode: str, client_count: int, failure_proba
             log_path = run_dir / f"client_{idx + 1}.log"
             client_logs.append(log_path)
             handle = log_path.open("w", encoding="utf-8")
-            if idx < local_n:
+            target = assignment[idx]
+            if target is None:
                 out_dir = run_dir / f"client_{idx + 1}_output"
                 out_dirs.append(out_dir)
                 cmd = [str(case_dir / "client"), a.server_host, str(port), topic, str(out_dir)] + extra
@@ -216,7 +265,7 @@ def run_one_scenario(case_name: str, mode: str, client_count: int, failure_proba
                 rdir = f"/tmp/it305_bench/{run_name}/c{idx + 1}"
                 rcmd = (f"cd {shlex.quote(remote_case)} && ./client {shlex.quote(a.server_host)} {port} "
                         f"{shlex.quote(topic)} {shlex.quote(rdir)} " + " ".join(extra))
-                proc = subprocess.Popen(ssh_argv(a.peer_ssh, rcmd), stdout=handle, stderr=subprocess.STDOUT, text=True)
+                proc = subprocess.Popen(ssh_argv(target, rcmd), stdout=handle, stderr=subprocess.STDOUT, text=True)
             procs.append((proc, handle))
         start_time = time.monotonic()
         for proc, handle in procs:
@@ -241,10 +290,18 @@ def run_one_scenario(case_name: str, mode: str, client_count: int, failure_proba
         if not a.keep_output:
             for od in out_dirs:
                 shutil.rmtree(od, ignore_errors=True)
-            if peer_n:
-                subprocess.run(ssh_argv(a.peer_ssh, f"rm -rf /tmp/it305_bench/{shlex.quote(run_name)}"),
+            for node in remote_nodes:
+                subprocess.run(ssh_argv(node, f"rm -rf /tmp/it305_bench/{shlex.quote(run_name)}"),
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     finally:
+        if server is not None and server.poll() is None and a.server_ssh:
+            # SIGINT lets the server drain and flush its SERVER_METRIC lines; works with or without a pty
+            subprocess.run(ssh_argv(a.server_ssh, "kill -INT $(cat /tmp/it305_server.pid) 2>/dev/null; true"),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                server.wait(timeout=12)
+            except subprocess.TimeoutExpired:
+                pass
         if server is not None and server.poll() is None:
             server.terminate()
             try:
@@ -264,11 +321,11 @@ def run_one_scenario(case_name: str, mode: str, client_count: int, failure_proba
     retries = sum(m["retries"] for m in valid_metrics)
     elapsed_sum = sum(m["elapsed_sec"] for m in valid_metrics)
     elapsed_max = max((m["elapsed_sec"] for m in valid_metrics), default=0.0)
-    server_bytes = server_data_bytes(server_log) if server_log.exists() else 0
+    server_bytes, server_window = server_metrics(server_log) if server_log.exists() else (0, 0.0)
     unique_source_bytes = source_topic_bytes(topics_root, topic) if topics_root and (topics_root / topic).is_dir() else 0
     window = elapsed_max if elapsed_max > 0 else wall_elapsed
     agg_throughput = useful / window if window > 0 else 0.0
-    nodes = "local" + (f"+{a.peer_ssh}" if peer_n else "") + (f" server={a.server_ssh or a.server_host}" if external else "")
+    nodes = "+".join("local" if n is None else n for n in node_list) + (f" server={a.server_ssh or a.server_host}" if external else "")
 
     row = {
         "scenario": run_name,
@@ -291,6 +348,11 @@ def run_one_scenario(case_name: str, mode: str, client_count: int, failure_proba
         "client_logs": ";".join(str(p.relative_to(PROJECT_ROOT)) for p in client_logs),
         "client_elapsed_sec_max": f"{elapsed_max:.9f}",
         "client_nodes": nodes,
+        "parallel_connections": a.parallel_connections if case_name == "Part2_Case2_Enhanced" else "",
+        "server_data_path": (a.server_data_path or "sendfile") if case_name == "Part2_Case2_Enhanced" else "",
+        "label": a.label or "",
+        "server_window_sec": f"{server_window:.9f}",
+        "server_aggregate_throughput_Bps": f"{(server_bytes / server_window) if server_window > 0 else 0.0:.3f}",
     }
     print(f"[{'OK' if succeeded else 'FAILED'}] {run_name}: agg={agg_throughput / 1e6:.2f} MB/s, "
           f"received={received}, useful={useful}, redundant={redundant}, server_sent={server_bytes}, retries={retries}")
@@ -340,6 +402,7 @@ def _symlog_x(ax, probabilities: list[float]) -> None:
 
 
 def generate_graphs(rows: list[dict[str, str]]) -> None:
+    rows = [r for r in rows if not r.get("label")]      # labelled rows are ablation runs: they must not be averaged into the main graphs
     if not rows:
         print("No metric rows available; graphs were not generated.")
         return
@@ -460,13 +523,18 @@ def main() -> int:
     parser.add_argument("--timeout-seconds", type=float, default=300.0, help="per-client time limit; a client that exceeds it is killed and the scenario marked FAILED")
     parser.add_argument("--server-host", default="127.0.0.1", help="address clients connect to (the server machine)")
     parser.add_argument("--server-ssh", help="user@host: start the server there over ssh (needs --remote-dir and --remote-topics)")
-    parser.add_argument("--peer-ssh", help="user@host: run half of the clients on this second client machine over ssh")
+    parser.add_argument("--client-ssh", help="comma-separated user@host list: machines that run clients (any number), over ssh")
+    parser.add_argument("--peer-ssh", help="user@host: one more client machine (kept for compatibility; same as adding it to --client-ssh)")
+    parser.add_argument("--no-local-clients", action="store_true", help="do not run clients on this machine (use when it only orchestrates)")
     parser.add_argument("--remote-dir", help="project root on the server/peer machines (same path on both), built with make")
     parser.add_argument("--remote-topics", help="topics root directory ON THE SERVER machine (default: --topics-root)")
     parser.add_argument("--manual-server", action="store_true", help="print the server command per scenario and wait instead of using ssh")
     parser.add_argument("--no-build", action="store_true", help="do not run `make clean all` locally before each scenario")
     parser.add_argument("--keep-output", action="store_true", help="keep downloaded files (they can be large)")
     parser.add_argument("--server-data-path", choices=["sendfile", "buffered"], help="Case 2 Enhanced only: server data path for the ablation study")
+    parser.add_argument("--no-warmup", action="store_true", help="skip reading the topic once before the first scenario (a cold first run distorts the first row)")
+    parser.add_argument("--label", default="", help="tag stored in the CSV for an ablation/variant run (e.g. K1, buffered); labelled rows are kept out of the main graphs")
+    parser.add_argument("--only", default="part1,case1,case2,enhanced", help="comma-separated subset of experiments to run: part1,case1,case2,enhanced")
     parser.add_argument("--append", action="store_true", help="append new experiment rows instead of replacing raw_metrics.csv")
     parser.add_argument("--graphs-only", action="store_true", help="generate graphs from existing raw_metrics.csv")
     args = parser.parse_args()
@@ -478,8 +546,11 @@ def main() -> int:
     if args.topic is None:
         parser.error("--topic is required unless --graphs-only is used")
     remote_server = bool(args.server_ssh) or args.manual_server
-    if (args.server_ssh or args.peer_ssh) and not args.remote_dir:
-        parser.error("--server-ssh/--peer-ssh need --remote-dir (project root on the remote machines)")
+    args.client_ssh_list = [x.strip() for x in (args.client_ssh or "").split(",") if x.strip()] + ([args.peer_ssh] if args.peer_ssh else [])
+    if (args.server_ssh or args.client_ssh_list) and not args.remote_dir:
+        parser.error("--server-ssh/--client-ssh/--peer-ssh need --remote-dir (project root on the remote machines)")
+    if args.no_local_clients and not args.client_ssh_list:
+        parser.error("--no-local-clients needs at least one --client-ssh machine")
     if remote_server and args.server_host in ("127.0.0.1", "localhost"):
         parser.error("with a remote server, set --server-host to its IP address")
     if args.topics_root is None and not (remote_server and args.remote_topics):
@@ -498,20 +569,29 @@ def main() -> int:
     if args.parallel_connections < 1 or args.parallel_connections > 64:
         parser.error("parallel connections must be in 1..64")
 
+    only = {x.strip() for x in args.only.split(",") if x.strip()}
+    if not only <= {"part1", "case1", "case2", "enhanced"}:
+        parser.error("--only takes a comma-separated subset of: part1,case1,case2,enhanced")
+    if not args.no_warmup:
+        warm_cache(args, topics_root, args.topic)
     rows: list[dict[str, Any]] = list(existing)
     next_port = args.port_start
+    # rows are written after EVERY scenario, so a crash or Ctrl-C hours into a lab session loses nothing
     for count in clients:
-        for mode in ("single", "multi"):
-            for rep in range(1, args.repeat + 1):
-                rows.append(run_one_scenario("Part1", mode, count, 0.0, rep, next_port,
-                                             topics_root, args.topic, args))
-                next_port += 101
-        for case in ("Part2_Case1", "Part2_Case2", "Part2_Case2_Enhanced"):
+        if "part1" in only:
+            for mode in ("single", "multi"):
+                for rep in range(1, args.repeat + 1):
+                    rows.append(run_one_scenario("Part1", mode, count, 0.0, rep, next_port,
+                                                 topics_root, args.topic, args))
+                    write_rows(CSV_PATH, rows); next_port += 101
+        for key, case in (("case1", "Part2_Case1"), ("case2", "Part2_Case2"), ("enhanced", "Part2_Case2_Enhanced")):
+            if key not in only:
+                continue
             for p in probabilities:
                 for rep in range(1, args.repeat + 1):
                     rows.append(run_one_scenario(case, "multi", count, p, rep, next_port,
                                                  topics_root, args.topic, args))
-                    next_port += 101
+                    write_rows(CSV_PATH, rows); next_port += 101
     write_rows(CSV_PATH, rows)
     generate_graphs(read_rows(CSV_PATH))
     return 0

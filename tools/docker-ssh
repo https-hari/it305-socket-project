@@ -1,0 +1,15 @@
+#!/bin/sh
+# Drop-in stand-in for `ssh` that runs the command inside a Docker container instead:
+#     docker-ssh [ssh options] user@CONTAINER 'command'
+# benchmark.py uses it when IT305_SSH points here, so the three-computer experiment can be rehearsed with three
+# containers (see tools/rig.sh).
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) shift 2 ;;
+    -tt|-t|-T|-q) shift ;;
+    *) break ;;
+  esac
+done
+target=${1#*@}
+shift
+exec docker exec -i "$target" sh -c "$1"
